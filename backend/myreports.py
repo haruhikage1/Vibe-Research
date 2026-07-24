@@ -153,6 +153,11 @@ def save_report(name: str, content_b64: str) -> dict:
         items = _load_index()
         items.append(meta)
         _save_index(items)
+    try:
+        import rag
+        rag.index_report(rid, REPORTS_DIR / f"{rid}{ext}", fname, meta["industry"])
+    except Exception:
+        pass
     return meta
 
 
@@ -176,6 +181,11 @@ def delete_report(rid: str) -> bool:
         try:
             fp.unlink(missing_ok=True)
         except OSError:
+            pass
+        try:
+            import rag
+            rag.remove_report(rid)
+        except Exception:
             pass
         _save_index([r for r in items if r.get("id") != rid])
     return True

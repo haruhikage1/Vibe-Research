@@ -36,6 +36,25 @@ export interface MyReport {
   id: string; name: string; industry: string; size: number; ext: string; ts: number;
 }
 
+export interface RagStatus {
+  mode: string; indexed_chunks: number; indexed_reports: number; deps_missing: string[];
+}
+
+export interface ConversationMessage {
+  role: "user" | "assistant";
+  content: string;
+  tools?: { tool: string; args: Record<string, unknown> }[];
+  ts?: number;
+}
+export interface Conversation {
+  id: string; title: string; page: string; context_summary: string;
+  messages: ConversationMessage[]; created_at: number; updated_at: number;
+}
+export interface ConversationListItem {
+  id: string; title: string; page: string; context_summary: string;
+  message_count: number; last_preview: string; created_at: number; updated_at: number;
+}
+
 // 下载/预览研报：带鉴权头 fetch → blob → 触发浏览器下载（<a download> 无法带 Authorization，故走 blob）。
 export async function downloadReport(id: string, name: string): Promise<void> {
   const resp = await fetch(`/api/myreports/file/${id}`, { headers: authHeaders() });
@@ -272,4 +291,15 @@ export const api = {
   uploadReport: (name: string, contentB64: string) =>
     request<MyReport>("/myreports", "POST", { name, content_b64: contentB64 }),
   deleteReport: (id: string) => request<{ ok: boolean }>(`/myreports/${id}`, "DELETE"),
+  ragStatus: () => get<RagStatus>("/rag/status"),
+  ragReindex: () => request<{ reindexed: number; details: { report_id: string; chunks: number; skipped: string | null }[] }>("/rag/reindex", "POST"),
+  ragIndexOne: (id: string) => request<{ report_id: string; chunks: number; skipped: string | null }>(`/rag/index/${id}`, "POST"),
+  conversations: (page?: string) => get<ConversationListItem[]>(`/conversations${page ? `?page=${page}` : ""}`),
+  conversation: (id: string) => get<Conversation>(`/conversations/${id}`),
+  createConversation: (page: string, context: string, firstMessage: string) =>
+    request<Conversation>("/conversations", "POST", { page, context, first_message: firstMessage }),
+  appendMessage: (id: string, role: string, content: string, tools?: ConversationMessage["tools"]) =>
+    request<Conversation>(`/conversations/${id}/messages`, "POST", { role, content, tools }),
+  deleteConversation: (id: string) => request<{ ok: boolean }>(`/conversations/${id}`, "DELETE"),
+  clearConversations: (page?: string) => request<{ deleted: number }>(`/conversations${page ? `?page=${page}` : ""}`, "DELETE"),
 };

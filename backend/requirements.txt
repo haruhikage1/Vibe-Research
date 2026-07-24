@@ -1,5 +1,6 @@
 # 核心（轻量、秒装）——行情 + 研报即刻可用
 fastapi>=0.110
+pydantic>=2
 uvicorn[standard]>=0.29
 requests
 
@@ -8,3 +9,8 @@ requests
 akshare>=1.10
 mootdx>=0.10
 pandas
+
+# 研报 RAG（可选）——未装时 query_reports 工具降级（跳过该格式 / 退化为字符 bigram）
+pypdf>=4.0
+python-docx>=1.1
+jieba>=0.42

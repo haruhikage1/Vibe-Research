@@ -35,6 +35,7 @@ export function SectorDetail() {
           <AskAiButton
             context={aiContext}
             label="让 AI 拆这个板块"
+            page="sector-detail"
             suggestions={["按七维框架拆解", "这个板块的产业链地图", "哪个环节卡脖子", "有什么风险信号"]}
           />
         }

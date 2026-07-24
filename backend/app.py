@@ -10,7 +10,9 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
+import traceback
 
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -20,11 +22,16 @@ from pydantic import BaseModel
 import astock
 import chat as chat_layer
 import cli_runtime
+import conversations
 import gstock
 import newsradar
 import portfolio as pf
 import market
 import myreports as mr
+import rag
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
+logger = logging.getLogger("vibe-research")
 
 app = FastAPI(title="Vibe-Research API", version="0.1.3")
 
@@ -107,7 +114,7 @@ def chat(req: ChatReq):
     elif not req.llm.apiKey or not req.llm.baseURL:
         raise HTTPException(400, "缺少 Base URL 或 API Key，请先在「接入 AI」里填写")
 
-    cfg = req.llm.model_dump()
+    cfg = req.llm.model_dump() if hasattr(req.llm, "model_dump") else req.llm.dict()
 
     def gen():
         try:
@@ -115,6 +122,7 @@ def chat(req: ChatReq):
             for ev in events:
                 yield json.dumps(ev, ensure_ascii=False) + "\n"
         except Exception as e:  # noqa: BLE001 — 运行时错误以流内事件上报，不中断连接
+            logger.error("对话失败：%s\n%s", e, traceback.format_exc())
             yield json.dumps({"type": "error", "message": f"对话失败：{e}"}, ensure_ascii=False) + "\n"
 
     return StreamingResponse(gen(), media_type="application/x-ndjson")
@@ -599,3 +607,109 @@ def industry(top: int = Query(20, ge=5, le=50)):
         return {"data": data}
     except Exception as e:  # noqa: BLE001
         raise HTTPException(502, f"行业排名异常：{e}") from e
+
+
+# ---------------------------------------------------------------------------
+# 研报 RAG（检索用户上传的研报内容，存本地 ~/.vibe-research/rag/）
+# ---------------------------------------------------------------------------
+
+@app.get("/api/rag/status")
+def rag_status():
+    """RAG 索引状态：模式 / 已索引块数 / 已索引研报数 / 缺失依赖。"""
+    try:
+        return {"data": rag.status()}
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(502, f"RAG 状态异常：{e}") from e
+
+
+@app.post("/api/rag/reindex")
+def rag_reindex():
+    """重建全部研报索引（切换依赖 / 修复解析失败后用）。"""
+    try:
+        items = mr.list_reports()
+        return {"data": rag.reindex_all(items)}
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(502, f"重建索引失败：{e}") from e
+
+
+@app.post("/api/rag/index/{rid}")
+def rag_index_one(rid: str):
+    """手动索引单份研报（首次索引失败后重试）。"""
+    try:
+        for r in mr.list_reports():
+            if r.get("id") == rid:
+                fp = mr.REPORTS_DIR / f"{rid}{r.get('ext', '')}"
+                if not fp.exists():
+                    raise HTTPException(404, "研报文件不存在")
+                return {"data": rag.index_report(rid, fp, r.get("name", rid), r.get("industry", ""))}
+        raise HTTPException(404, "研报不存在")
+    except HTTPException:
+        raise
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(502, f"索引失败：{e}") from e
+
+
+# ---------------------------------------------------------------------------
+# 对话记忆（多轮对话持久化，存本地 ~/.vibe-research/conversations.json）
+# ---------------------------------------------------------------------------
+
+class ConvCreate(BaseModel):
+    page: str
+    context: str
+    first_message: str
+
+
+class ConvAppend(BaseModel):
+    role: str
+    content: str
+    tools: list | None = None
+
+
+@app.get("/api/conversations")
+def conversations_list(page: str = Query(None)):
+    """对话列表（元数据，不含 messages 正文）。按更新时间倒序。"""
+    try:
+        return {"data": conversations.list_conversations(page=page)}
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(502, f"对话列表异常：{e}") from e
+
+
+@app.get("/api/conversations/{cid}")
+def conversations_get(cid: str):
+    """取完整对话含 messages。"""
+    c = conversations.get_conversation(cid)
+    if not c:
+        raise HTTPException(404, "对话不存在")
+    return {"data": c}
+
+
+@app.post("/api/conversations")
+def conversations_create(req: ConvCreate):
+    """新建对话（首条用户消息一并存入）。"""
+    try:
+        return {"data": conversations.create_conversation(req.page, req.context, req.first_message)}
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(502, f"创建对话失败：{e}") from e
+
+
+@app.post("/api/conversations/{cid}/messages")
+def conversations_append(cid: str, req: ConvAppend):
+    """追加一条消息（用户追问 / AI 回复）。"""
+    c = conversations.append_message(cid, req.role, req.content, req.tools)
+    if not c:
+        raise HTTPException(404, "对话不存在")
+    return {"data": c}
+
+
+@app.delete("/api/conversations/{cid}")
+def conversations_delete(cid: str):
+    return {"data": {"ok": conversations.delete_conversation(cid)}}
+
+
+@app.delete("/api/conversations")
+def conversations_clear(page: str = Query(None)):
+    """清空对话（可按 page 过滤）。"""
+    try:
+        return {"data": {"deleted": conversations.clear_conversations(page)}}
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(502, f"清空对话失败：{e}") from e

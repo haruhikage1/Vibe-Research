@@ -129,6 +129,7 @@ export function DailyReview() {
           <AskAiButton
             context={`今日大盘数据：${dataSummary}`}
             label="问 AI"
+            page="daily-review"
             suggestions={["今天大盘怎么走", "哪些指数领涨领跌", "盘面有什么值得注意"]}
           />
         }

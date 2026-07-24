@@ -1,9 +1,9 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { Upload, FileText, Trash2, Download, Loader2, FolderOpen } from "lucide-react";
+import { Upload, FileText, Trash2, Download, Loader2, FolderOpen, Search, RefreshCw } from "lucide-react";
 import { PageHeader } from "@/components/ui/PageHeader";
 import { GlassCard } from "@/components/ui/GlassCard";
 import { Disclaimer } from "@/components/ui/Disclaimer";
-import { api, ApiError, downloadReport, type MyReport } from "@/lib/api";
+import { api, ApiError, downloadReport, type MyReport, type RagStatus } from "@/lib/api";
 import { cn } from "@/lib/utils";
 
 const fmtSize = (b: number) =>
@@ -11,7 +11,6 @@ const fmtSize = (b: number) =>
 const fmtDate = (ts: number) =>
   new Date(ts).toLocaleDateString("zh-CN", { year: "numeric", month: "2-digit", day: "2-digit" });
 
-// 读文件为 dataURL（含 base64）；后端会剥掉 data: 前缀。
 const fileToB64 = (file: File): Promise<string> =>
   new Promise((resolve, reject) => {
     const reader = new FileReader();
@@ -22,7 +21,9 @@ const fileToB64 = (file: File): Promise<string> =>
 
 export function MyReports() {
   const [reports, setReports] = useState<MyReport[]>([]);
+  const [ragStatus, setRagStatus] = useState<RagStatus | null>(null);
   const [busy, setBusy] = useState(false);
+  const [reindexing, setReindexing] = useState(false);
   const [err, setErr] = useState<string | null>(null);
   const [drag, setDrag] = useState(false);
   const inputRef = useRef<HTMLInputElement>(null);
@@ -32,6 +33,11 @@ export function MyReports() {
       setReports(await api.myReports());
     } catch (e) {
       setErr(e instanceof ApiError ? e.message : "加载研报列表失败");
+    }
+    try {
+      setRagStatus(await api.ragStatus());
+    } catch {
+      setRagStatus(null);
     }
   };
   useEffect(() => {
@@ -72,10 +78,21 @@ export function MyReports() {
     }
   };
 
+  const reindex = async () => {
+    setReindexing(true);
+    try {
+      await api.ragReindex();
+      await load();
+    } catch (e) {
+      setErr(e instanceof ApiError ? e.message : "重建索引失败");
+    } finally {
+      setReindexing(false);
+    }
+  };
+
   const grouped = useMemo(() => {
     const g: Record<string, MyReport[]> = {};
     for (const r of reports) (g[r.industry] ||= []).push(r);
-    // 「未分类」排最后，其余按条数多→少
     return Object.entries(g).sort((a, b) =>
       a[0] === "未分类" ? 1 : b[0] === "未分类" ? -1 : b[1].length - a[1].length,
     );
@@ -88,7 +105,6 @@ export function MyReports() {
         subtitle="把自己的研报拖进来归档，自动按行业分类。文件只存在本地部署目录、不上传、不进任何仓库。"
       />
 
-      {/* 上传区 */}
       <GlassCard className="mb-4">
         <div
           onDragOver={(e) => {
@@ -132,13 +148,34 @@ export function MyReports() {
         </div>
       </GlassCard>
 
+      {ragStatus && (
+        <div className="mb-4 flex items-center justify-between rounded-lg border border-border/50 bg-muted/20 px-4 py-2.5 text-xs">
+          <div className="flex items-center gap-2 text-muted-foreground">
+            <Search className="h-3.5 w-3.5" />
+            <span>
+              RAG 索引：<b className="text-foreground">{ragStatus.indexed_reports}</b> 份研报 · <b className="text-foreground">{ragStatus.indexed_chunks}</b> 段已索引
+              {ragStatus.deps_missing.length > 0 && (
+                <span className="ml-2 text-warning">缺依赖：{ragStatus.deps_missing.join("、")}</span>
+              )}
+            </span>
+          </div>
+          <button
+            onClick={reindex}
+            disabled={reindexing || reports.length === 0}
+            className="inline-flex items-center gap-1.5 rounded-lg px-2.5 py-1 text-xs text-muted-foreground hover:text-primary disabled:opacity-40"
+          >
+            {reindexing ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <RefreshCw className="h-3.5 w-3.5" />}
+            重建索引
+          </button>
+        </div>
+      )}
+
       {err && (
         <div className="mb-4 rounded-lg border border-destructive/30 bg-destructive/5 p-3 text-sm text-destructive">
           {err}
         </div>
       )}
 
-      {/* 列表（按行业分组） */}
       {reports.length === 0 ? (
         <GlassCard>
           <div className="flex flex-col items-center gap-2 py-10 text-center text-sm text-muted-foreground">

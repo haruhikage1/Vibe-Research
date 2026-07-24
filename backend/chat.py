@@ -11,8 +11,10 @@ from __future__ import annotations
 
 import ipaddress
 import json
+import logging
 import os
 import socket
+import traceback
 from urllib.parse import urlparse
 
 import requests
@@ -20,6 +22,8 @@ import requests
 import astock
 import cli_runtime
 import gstock
+
+logger = logging.getLogger("vibe-research.chat")
 
 MAX_ROUNDS = 6  # 工具调用最大轮数，防死循环
 _TOOL_RESULT_CAP = 6000  # 单次工具结果注入上限（控 token）
@@ -45,7 +49,8 @@ ANALYSIS_FRAMEWORK = """【投研分析框架】当用户要你分析个股、�
 # 用 f-string 先把框架焊进去，只留 {{context}} 给运行时 .format() 填——4 处调用点无需改。
 SYSTEM_PROMPT = f"""你是 Vibe-Research 里的投研助理。你可以调用工具获取客观数据来支撑回答：
 A 股用 query_quote / query_valuation / query_reports / query_news（传 6 位代码）；
-美股 / 港股 / 韩股用 query_global_stock（美股用字母代码如 AAPL / NVDA，港股用数字如 00700，韩股用 6 位数字加 .KS 如三星 005930.KS）。
+美股 / 港股 / 韩股用 query_global_stock（美股用字母代码如 AAPL / NVDA，港股用数字如 00700，韩股用 6 位数字加 .KS 如三星 005930.KS）；
+用户上传的研报用 query_reports（传检索关键词，可选 industry 过滤行业）——可检索用户自己归档的研报内容。
 
 硬性规则（务必遵守）：
 - 只做信息整理、数据解读与多视角分析；不推荐任何具体买卖、不预测涨跌与价位、不给买卖时机、不承诺收益、不打分排名。
@@ -121,6 +126,21 @@ TOOLS = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "query_reports",
+            "description": "检索用户上传的研报中与查询相关的段落。返回 top-k 最相关的文本片段及其来源研报名/行业。industry 可选过滤行业（如「半导体」「AI算力」）。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "检索关键词或问题"},
+                    "industry": {"type": "string", "description": "可选：限定行业（如「半导体」「AI算力」）"},
+                },
+                "required": ["query"],
+            },
+        },
+    },
 ]
 
 
@@ -140,6 +160,9 @@ def _exec_tool(name: str, args: dict):
         if name == "query_global_stock":
             data = gstock.us_hk_stock(str(args.get("symbol", "")))
             return data or {"error": "未找到该美股/港股/韩股代码"}
+        if name == "query_reports":
+            import rag
+            return rag.search(str(args.get("query", "")), top_k=5, industry=args.get("industry"))
         return {"error": f"未知工具 {name}"}
     except astock.DependencyMissing as e:
         return {"error": str(e)}
@@ -177,14 +200,17 @@ def _check_base_url(url: str) -> None:
     if not host:
         raise RuntimeError("Base URL 缺少主机名")
     if _ip_blocked(host):
+        logger.error("SSRF 拦截：baseURL=%s 指向不允许的地址", url)
         raise RuntimeError("Base URL 指向了不允许的地址（云元数据 / 内网）")
     if _PUBLIC_MODE:  # 公网姿态：域名也解析核对，防 DNS rebinding 指向内网
         try:
             infos = socket.getaddrinfo(host, None)
         except socket.gaierror as e:
+            logger.error("SSRF 域名解析失败：baseURL=%s, %s", url, e)
             raise RuntimeError("Base URL 域名无法解析") from e
         for info in infos:
             if _ip_blocked(info[4][0]):
+                logger.error("SSRF 拦截：baseURL=%s 解析到内网地址 %s", url, info[4][0])
                 raise RuntimeError("Base URL 解析到了不允许的内网地址")
 
 
@@ -205,6 +231,7 @@ def _call_llm(cfg: dict, messages: list, use_tools: bool) -> dict:
         timeout=90,
     )
     if r.status_code != 200:
+        logger.error("LLM 非 200：HTTP %s, url=%s, model=%s, body=%s", r.status_code, base, cfg.get("model"), r.text[:500])
         raise RuntimeError(f"模型接口 HTTP {r.status_code}: {r.text[:300]}")
     return r.json()
 
@@ -285,6 +312,7 @@ def _call_llm_stream(cfg: dict, messages: list, use_tools: bool):
         json=payload, timeout=120, stream=True,
     )
     if r.status_code != 200:
+        logger.error("LLM 流式非 200：HTTP %s, url=%s, model=%s, body=%s", r.status_code, _resolve_base(cfg), cfg.get("model"), r.text[:500])
         raise RuntimeError(f"模型接口 HTTP {r.status_code}: {r.text[:300]}")
     return r
 

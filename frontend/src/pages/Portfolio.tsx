@@ -104,6 +104,7 @@ export function Portfolio() {
           <div className="flex items-center gap-2">
             {holdings.length > 0 && (
               <AskAiButton context={aiContext} label="让 AI 看我的持仓"
+                page="portfolio"
                 suggestions={["我的持仓集中在哪些方向", "结构上有什么风险", "帮我梳理一下"]} />
             )}
             <button onClick={() => load(true)} disabled={refreshing}

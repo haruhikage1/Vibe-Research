@@ -1,16 +1,16 @@
 import { useState, useRef, useEffect } from "react";
 import { Link } from "react-router-dom";
-import { Sparkles, X, Settings, Send, Loader2, Wrench, AlertCircle } from "lucide-react";
+import { Sparkles, X, Settings, Send, Loader2, Wrench, AlertCircle, Plus, History } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { hasLlm, chatStream, type ChatMsg } from "@/lib/llm";
-import { ApiError } from "@/lib/api";
+import { api, ApiError, type ConversationListItem } from "@/lib/api";
 import { SaveNoteButton } from "@/components/ui/SaveNoteButton";
 
 interface Props {
-  // 本分栏/本页要喂给用户 AI 的上下文，作为对话的系统上下文。
   context: string;
   suggestions?: string[];
   label?: string;
+  page: string;
 }
 
 const TOOL_LABEL: Record<string, string> = {
@@ -18,41 +18,96 @@ const TOOL_LABEL: Record<string, string> = {
   query_valuation: "查估值",
   query_reports: "查研报",
   query_news: "查新闻",
+  query_global_stock: "查美港股",
+  query_reports_rag: "查研报库",
 };
 
-// 数据溯源：把工具调用的关键参数压成一小段（查了哪只/哪些代码）。
 const argStr = (a: Record<string, unknown>): string => {
   if (Array.isArray(a.codes)) return (a.codes as unknown[]).join(",");
   if (typeof a.code === "string") return a.code;
+  if (typeof a.query === "string") return a.query.slice(0, 12);
   return "";
 };
 
 interface ToolUse { name: string; arg: string }
 
-// 「问 AI」入口 —— 把当前分栏内容作为上下文，调用户自己配置的模型；
-// AI 可自行调 A股数据工具作答。结论由用户模型给出，本产品不校准、不负责。
-export function AskAiButton({ context, suggestions = [], label = "问 AI" }: Props) {
+export function AskAiButton({ context, suggestions = [], label = "问 AI", page }: Props) {
   const [open, setOpen] = useState(false);
   const [configured, setConfigured] = useState(false);
   const [msgs, setMsgs] = useState<(ChatMsg & { tools?: ToolUse[] })[]>([]);
   const [input, setInput] = useState("");
   const [loading, setLoading] = useState(false);
   const [err, setErr] = useState<string | null>(null);
+  const [conversationId, setConversationId] = useState<string | null>(null);
+  const [historyList, setHistoryList] = useState<ConversationListItem[]>([]);
+  const [showHistory, setShowHistory] = useState(false);
   const scrollRef = useRef<HTMLDivElement>(null);
-  // 在跑的流式请求：关面板/换问题时中止，省用户的订阅/API 额度，也防迟到 chunk 写进新气泡
   const abortRef = useRef<AbortController | null>(null);
 
   useEffect(() => {
     if (open) setConfigured(hasLlm());
   }, [open]);
 
-  useEffect(() => () => abortRef.current?.abort(), []); // 组件卸载兜底
+  useEffect(() => () => abortRef.current?.abort(), []);
+
+  const loadHistory = async () => {
+    try {
+      setHistoryList(await api.conversations(page));
+    } catch {
+      setHistoryList([]);
+    }
+  };
+
+  const restoreConversation = async (cid: string) => {
+    try {
+      const conv = await api.conversation(cid);
+      setConversationId(conv.id);
+      setMsgs(conv.messages.map((m) => ({
+        role: m.role,
+        content: m.content,
+        tools: m.tools?.map((t) => ({ name: t.tool, arg: argStr(t.args as Record<string, unknown>) })),
+      })));
+      setShowHistory(false);
+    } catch {
+      setErr("加载对话失败");
+    }
+  };
+
+  const startNewConversation = () => {
+    abortRef.current?.abort();
+    abortRef.current = null;
+    setLoading(false);
+    setConversationId(null);
+    setMsgs([]);
+    setErr(null);
+    setShowHistory(false);
+  };
+
+  useEffect(() => {
+    if (open && configured) {
+      loadHistory();
+      if (!conversationId && msgs.length === 0) {
+        (async () => {
+          try {
+            const list = await api.conversations(page);
+            const recent = list[0];
+            if (recent && Date.now() - recent.updated_at < 86400000 && recent.message_count > 1) {
+              await restoreConversation(recent.id);
+            }
+          } catch {
+            /* 静默 */
+          }
+        })();
+      }
+    }
+  }, [open, configured]);
 
   const close = () => {
     abortRef.current?.abort();
     abortRef.current = null;
     setLoading(false);
     setOpen(false);
+    setShowHistory(false);
   };
 
   useEffect(() => {
@@ -65,24 +120,46 @@ export function AskAiButton({ context, suggestions = [], label = "问 AI" }: Pro
     setInput("");
     setErr(null);
     const history: ChatMsg[] = [...msgs.map(({ role, content }) => ({ role, content })), { role: "user", content: q }];
-    // 先放用户气泡 + 一个空的 assistant 气泡，流式往里填。
     setMsgs((m) => [...m, { role: "user", content: q }, { role: "assistant", content: "", tools: [] }]);
     setLoading(true);
-    // 更新「最后一条 assistant 气泡」（不可变）。
     const patchLast = (fn: (msg: ChatMsg & { tools?: ToolUse[] }) => ChatMsg & { tools?: ToolUse[] }) =>
       setMsgs((m) => m.map((msg, i) => (i === m.length - 1 && msg.role === "assistant" ? fn(msg) : msg)));
     abortRef.current?.abort();
     const ac = new AbortController();
     abortRef.current = ac;
-    // 只有仍是「当前这次请求」才允许写 UI——旧请求的迟到 chunk 直接丢弃
     const alive = () => abortRef.current === ac && !ac.signal.aborted;
+
+    let cid = conversationId;
+    if (!cid) {
+      try {
+        const conv = await api.createConversation(page, context.slice(0, 200), q);
+        cid = conv.id;
+        setConversationId(cid);
+      } catch {
+        /* 持久化失败不阻塞对话 */
+      }
+    } else {
+      try {
+        await api.appendMessage(cid, "user", q);
+      } catch {
+        /* 同上 */
+      }
+    }
+
     try {
-      await chatStream(history, context, {
+      const result = await chatStream(history, context, {
         onTool: (tool, args) => { if (alive()) patchLast((msg) => ({ ...msg, tools: [...(msg.tools || []), { name: tool, arg: argStr(args) }] })); },
         onDelta: (t) => { if (alive()) patchLast((msg) => ({ ...msg, content: msg.content + t })); },
       }, ac.signal);
+      if (cid) {
+        try {
+          await api.appendMessage(cid, "assistant", result.content,
+            result.trace.map((t) => ({ tool: t.tool, args: t.args })));
+        } catch {
+          /* 同上 */
+        }
+      }
     } catch (e) {
-      // 出错/中止：去掉尾部空 assistant 气泡；主动中止不算错误，不提示
       setMsgs((m) => m.filter((msg, i) => !(i === m.length - 1 && msg.role === "assistant" && !msg.content)));
       if (!ac.signal.aborted) setErr(e instanceof ApiError ? e.message : "对话失败");
     } finally {
@@ -111,13 +188,32 @@ export function AskAiButton({ context, suggestions = [], label = "问 AI" }: Pro
               <span className="flex items-center gap-2 font-semibold text-glow">
                 <Sparkles className="h-4 w-4 text-primary" /> 问 AI · 本页上下文
               </span>
-              <button onClick={close} className="text-muted-foreground hover:text-foreground">
-                <X className="h-4 w-4" />
-              </button>
+              <div className="flex items-center gap-1.5">
+                {configured && (
+                  <>
+                    <button
+                      onClick={startNewConversation}
+                      className="rounded-lg p-1.5 text-muted-foreground hover:text-primary"
+                      title="新对话"
+                    >
+                      <Plus className="h-4 w-4" />
+                    </button>
+                    <button
+                      onClick={() => { setShowHistory(!showHistory); if (!showHistory) loadHistory(); }}
+                      className={cn("rounded-lg p-1.5", showHistory ? "text-primary" : "text-muted-foreground hover:text-primary")}
+                      title="历史对话"
+                    >
+                      <History className="h-4 w-4" />
+                    </button>
+                  </>
+                )}
+                <button onClick={close} className="text-muted-foreground hover:text-foreground">
+                  <X className="h-4 w-4" />
+                </button>
+              </div>
             </div>
 
             {!configured ? (
-              // 未接入 AI：引导去设置
               <div className="flex-1 space-y-4 overflow-auto p-4 text-sm">
                 <div className="rounded-lg border border-warning/30 bg-warning/5 p-3 text-xs text-muted-foreground">
                   分析结论由你自己配置的 AI 给出，本产品只负责把本页数据打包成上下文、并让 AI 能调数据工具，
@@ -133,8 +229,28 @@ export function AskAiButton({ context, suggestions = [], label = "问 AI" }: Pro
                   <Settings className="h-4 w-4" /> 先接入你的 AI（订阅 / API）
                 </Link>
               </div>
+            ) : showHistory ? (
+              <div className="flex-1 overflow-auto p-4">
+                {historyList.length === 0 ? (
+                  <p className="py-8 text-center text-sm text-muted-foreground">还没有历史对话</p>
+                ) : (
+                  <div className="space-y-2">
+                    {historyList.map((h) => (
+                      <button
+                        key={h.id}
+                        onClick={() => restoreConversation(h.id)}
+                        className="block w-full rounded-lg border border-border/40 bg-muted/20 p-3 text-left hover:border-primary/40"
+                      >
+                        <p className="truncate text-sm font-medium">{h.title}</p>
+                        <p className="mt-0.5 truncate text-[11px] text-muted-foreground/60">
+                          {h.message_count} 条消息 · {new Date(h.updated_at).toLocaleString("zh-CN", { month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit" })}
+                        </p>
+                      </button>
+                    ))}
+                  </div>
+                )}
+              </div>
             ) : (
-              // 已接入：真对话
               <>
                 <div ref={scrollRef} className="flex-1 space-y-3 overflow-auto p-4 text-sm">
                   {msgs.length === 0 && (

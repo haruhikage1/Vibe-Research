@@ -201,6 +201,7 @@ export function StockData() {
           <AskAiButton
             context={gstock ? gAiContext : aiContext}
             label="让 AI 读这些数据"
+            page="stock-data"
             suggestions={gstock
               ? ["这家公司基本面怎么样", "盈利能力如何", "有什么风险"]
               : ["这个估值贵不贵", "机构一致预期怎么看", "近期研报的分歧点", "有什么风险"]}

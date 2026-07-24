@@ -68,6 +68,7 @@ export function Watchlist() {
             <AskAiButton
               context={aiContext}
               label="让 AI 读自选"
+              page="watchlist"
               suggestions={["这几只里哪些估值偏高", "帮我按赛道分组看看", "各自最大的风险点是什么"]}
             />
           )
