@@ -1,8 +1,8 @@
 import { useState, useRef, useEffect } from "react";
 import { Link } from "react-router-dom";
-import { Sparkles, X, Settings, Send, Loader2, Wrench, AlertCircle, Plus, History } from "lucide-react";
+import { Sparkles, X, Settings, Send, Loader2, Wrench, AlertCircle, Plus, History, Users, User } from "lucide-react";
 import { cn } from "@/lib/utils";
-import { hasLlm, chatStream, type ChatMsg } from "@/lib/llm";
+import { hasLlm, chatStream, chatCommitteeStream, type ChatMsg } from "@/lib/llm";
 import { api, ApiError, type ConversationListItem } from "@/lib/api";
 import { SaveNoteButton } from "@/components/ui/SaveNoteButton";
 
@@ -31,10 +31,34 @@ const argStr = (a: Record<string, unknown>): string => {
 
 interface ToolUse { name: string; arg: string }
 
+const AGENTS = ["价值派", "成长派", "量化派", "风险派", "综合派"];
+const AGENT_COLORS: Record<string, string> = {
+  "价值派": "border-emerald-500/40 bg-emerald-500/5",
+  "成长派": "border-sky-500/40 bg-sky-500/5",
+  "量化派": "border-violet-500/40 bg-violet-500/5",
+  "风险派": "border-rose-500/40 bg-rose-500/5",
+  "综合派": "border-amber-500/40 bg-amber-500/5",
+};
+const AGENT_HEADER_COLORS: Record<string, string> = {
+  "价值派": "text-emerald-400",
+  "成长派": "text-sky-400",
+  "量化派": "text-violet-400",
+  "风险派": "text-rose-400",
+  "综合派": "text-amber-400",
+};
+
+interface AgentContent {
+  content: string;
+  tools: ToolUse[];
+  done: boolean;
+}
+
 export function AskAiButton({ context, suggestions = [], label = "问 AI", page }: Props) {
   const [open, setOpen] = useState(false);
   const [configured, setConfigured] = useState(false);
+  const [committeeMode, setCommitteeMode] = useState(false);
   const [msgs, setMsgs] = useState<(ChatMsg & { tools?: ToolUse[] })[]>([]);
+  const [agentContents, setAgentContents] = useState<Record<string, AgentContent>>({});
   const [input, setInput] = useState("");
   const [loading, setLoading] = useState(false);
   const [err, setErr] = useState<string | null>(null);
@@ -119,6 +143,51 @@ export function AskAiButton({ context, suggestions = [], label = "问 AI", page 
     if (!q || loading) return;
     setInput("");
     setErr(null);
+
+    if (committeeMode) {
+      // ---- 委员会模式 ----
+      const history: ChatMsg[] = [...msgs.map(({ role, content }) => ({ role, content })), { role: "user", content: q }];
+      setMsgs((m) => [...m, { role: "user", content: q }]);
+      setLoading(true);
+      setAgentContents(Object.fromEntries(AGENTS.map((a) => [a, { content: "", tools: [], done: false }])));
+      abortRef.current?.abort();
+      const ac = new AbortController();
+      abortRef.current = ac;
+      const alive = () => abortRef.current === ac && !ac.signal.aborted;
+
+      try {
+        await chatCommitteeStream(history, context, AGENTS, {
+          onDelta: (agent, text) => {
+            if (alive()) setAgentContents((prev) => ({
+              ...prev,
+              [agent]: { ...prev[agent], content: prev[agent]?.content + text || text },
+            }));
+          },
+          onTool: (agent, tool, args) => {
+            if (alive()) setAgentContents((prev) => ({
+              ...prev,
+              [agent]: { ...prev[agent], tools: [...(prev[agent]?.tools || []), { name: tool, arg: argStr(args) }] },
+            }));
+          },
+          onAgentDone: (agent) => {
+            if (alive()) setAgentContents((prev) => ({
+              ...prev,
+              [agent]: { ...prev[agent], done: true },
+            }));
+          },
+        }, ac.signal);
+      } catch (e) {
+        if (!ac.signal.aborted) setErr(e instanceof ApiError ? e.message : "委员会对话失败");
+      } finally {
+        if (abortRef.current === ac) {
+          abortRef.current = null;
+          setLoading(false);
+        }
+      }
+      return;
+    }
+
+    // ---- 单 Agent 模式 ----
     const history: ChatMsg[] = [...msgs.map(({ role, content }) => ({ role, content })), { role: "user", content: q }];
     setMsgs((m) => [...m, { role: "user", content: q }, { role: "assistant", content: "", tools: [] }]);
     setLoading(true);
@@ -186,11 +255,18 @@ export function AskAiButton({ context, suggestions = [], label = "问 AI", page 
           <aside className="glass relative m-3 flex w-full max-w-md flex-col rounded-2xl">
             <div className="flex items-center justify-between border-b border-border/60 p-4">
               <span className="flex items-center gap-2 font-semibold text-glow">
-                <Sparkles className="h-4 w-4 text-primary" /> 问 AI · 本页上下文
+                <Sparkles className="h-4 w-4 text-primary" /> {committeeMode ? "投研委员会" : "问 AI · 本页上下文"}
               </span>
               <div className="flex items-center gap-1.5">
                 {configured && (
                   <>
+                    <button
+                      onClick={() => { setCommitteeMode(!committeeMode); startNewConversation(); }}
+                      className={cn("rounded-lg p-1.5", committeeMode ? "text-primary" : "text-muted-foreground hover:text-primary")}
+                      title={committeeMode ? "切换为单 AI 模式" : "切换为多 Agent 委员会模式"}
+                    >
+                      {committeeMode ? <Users className="h-4 w-4" /> : <User className="h-4 w-4" />}
+                    </button>
                     <button
                       onClick={startNewConversation}
                       className="rounded-lg p-1.5 text-muted-foreground hover:text-primary"
@@ -250,6 +326,83 @@ export function AskAiButton({ context, suggestions = [], label = "问 AI", page 
                   </div>
                 )}
               </div>
+            ) : committeeMode ? (
+              <>
+                <div ref={scrollRef} className="flex-1 overflow-auto p-2 text-xs">
+                  {msgs.filter((m) => m.role === "user").length > 0 && (
+                    <div className="mb-2 rounded-lg bg-primary/10 px-3 py-2 text-xs text-foreground/80">
+                      <span className="font-medium text-primary">问题：</span>
+                      {msgs.filter((m) => m.role === "user").pop()?.content}
+                    </div>
+                  )}
+                  <div className="grid grid-cols-5 gap-1.5">
+                    {AGENTS.map((agent) => {
+                      const ac = agentContents[agent] || { content: "", tools: [], done: false };
+                      return (
+                        <div key={agent} className={cn("flex flex-col rounded-lg border p-2", AGENT_COLORS[agent] || "border-border/40")}>
+                          <div className={cn("mb-1 text-[10px] font-bold", AGENT_HEADER_COLORS[agent] || "text-foreground")}>
+                            {agent}
+                            {ac.done && <span className="ml-1 text-[9px] text-muted-foreground/50">✓</span>}
+                          </div>
+                          {ac.tools.length > 0 && (
+                            <div className="mb-1 flex flex-wrap gap-0.5">
+                              {ac.tools.map((t, j) => (
+                                <span key={j} className="inline-flex items-center gap-0.5 rounded-full bg-primary/10 px-1.5 py-0.5 text-[9px] text-primary">
+                                  <Wrench className="h-2 w-2" /> {TOOL_LABEL[t.name] || t.name}{t.arg ? ` ${t.arg}` : ""}
+                                </span>
+                              ))}
+                            </div>
+                          )}
+                          <p className="whitespace-pre-wrap leading-relaxed text-muted-foreground">
+                            {ac.content || (loading && !ac.done ? <span className="italic text-muted-foreground/40">分析中…</span> : "")}
+                          </p>
+                          {ac.content && ac.done && (
+                            <div className="mt-auto pt-1">
+                              <SaveNoteButton kind="问AI" title={`委员会 · ${agent}`} content={ac.content} />
+                            </div>
+                          )}
+                        </div>
+                      );
+                    })}
+                  </div>
+                  {loading && (
+                    <div className="mt-2 flex items-center justify-center gap-2 text-[10px] text-muted-foreground">
+                      <Loader2 className="h-3 w-3 animate-spin" /> 委员会并行分析中…
+                    </div>
+                  )}
+                  {err && (
+                    <div className="mt-2 flex items-center gap-2 rounded-lg border border-destructive/30 bg-destructive/5 p-2 text-xs text-destructive">
+                      <AlertCircle className="h-3.5 w-3.5 shrink-0" /> {err}
+                    </div>
+                  )}
+                  {msgs.length === 0 && suggestions.length > 0 && (
+                    <div className="flex flex-wrap gap-1.5 pt-1">
+                      {suggestions.map((s) => (
+                        <button key={s} onClick={() => send(s)} className="rounded-full border border-border bg-muted/40 px-2.5 py-1 text-xs hover:border-primary/40 hover:text-primary">
+                          {s}
+                        </button>
+                      ))}
+                    </div>
+                  )}
+                </div>
+
+                <div className="border-t border-border/60 p-3">
+                  <div className="flex items-end gap-2">
+                    <textarea
+                      value={input}
+                      onChange={(e) => setInput(e.target.value)}
+                      onKeyDown={(e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(input); } }}
+                      rows={1}
+                      placeholder="就本页内容提问…"
+                      className="flex-1 resize-none rounded-lg border border-border bg-black/20 px-3 py-2 text-sm outline-none focus:border-primary/50"
+                    />
+                    <button onClick={() => send(input)} disabled={loading || !input.trim()}
+                      className="rounded-lg bg-primary/15 p-2 text-primary hover:bg-primary/25 disabled:opacity-40">
+                      <Send className="h-4 w-4" />
+                    </button>
+                  </div>
+                </div>
+              </>
             ) : (
               <>
                 <div ref={scrollRef} className="flex-1 space-y-3 overflow-auto p-4 text-sm">

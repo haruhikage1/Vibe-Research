@@ -116,3 +116,95 @@ export async function chatStream(messages: ChatMsg[], context: string, handlers:
 export function chat(messages: ChatMsg[], context: string): Promise<ChatResult> {
   return chatStream(messages, context);
 }
+
+// ---- 多 Agent 投研委员会 ----
+
+export interface CommitteeEvent {
+  type: "delta" | "tool" | "agent_done" | "done" | "error";
+  agent?: string;
+  text?: string;
+  tool?: string;
+  args?: Record<string, unknown>;
+  trace?: { tool: string; args: Record<string, unknown> }[];
+  rounds?: number;
+  agents?: string[];
+  message?: string;
+}
+
+export interface CommitteeHandlers {
+  onDelta?: (agent: string, text: string) => void;
+  onTool?: (agent: string, tool: string, args: Record<string, unknown>) => void;
+  onAgentDone?: (agent: string, trace: { tool: string; args: Record<string, unknown> }[], rounds: number) => void;
+}
+
+// 流式调后端 /api/chat/committee（NDJSON，每个事件带 agent 字段）。
+// 返回每个 agent 的最终结果。
+export async function chatCommitteeStream(
+  messages: ChatMsg[],
+  context: string,
+  agents: string[],
+  handlers: CommitteeHandlers = {},
+  signal?: AbortSignal,
+): Promise<Record<string, { content: string; trace: { tool: string; args: Record<string, unknown> }[]; rounds: number }>> {
+  const llm = loadLlm();
+  if (!llm) throw new ApiError("尚未接入 AI，请先在「接入 AI」里配置", 400);
+
+  let resp: Response;
+  try {
+    resp = await fetch("/api/chat/committee", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", ...authHeaders() },
+      body: JSON.stringify({ messages, context, llm, agents }),
+      signal,
+    });
+  } catch (e) {
+    if (e instanceof DOMException && e.name === "AbortError") throw e;
+    throw new ApiError("连接不到后端，请先启动 backend（uvicorn app:app --port 8900）", 0);
+  }
+  if (!resp.ok) {
+    let body: any = null;
+    try { body = await resp.json(); } catch { /* ignore */ }
+    if (resp.status === 401) {
+      throw new ApiError("后端开启了访问鉴权（VR_API_KEY）：请在「接入 AI」页底部填写后端访问密钥", 401);
+    }
+    throw new ApiError(body?.detail || `HTTP ${resp.status}`, resp.status);
+  }
+  if (!resp.body) throw new ApiError("后端无响应流", 502);
+
+  const reader = resp.body.getReader();
+  const decoder = new TextDecoder();
+  let buf = "";
+  const results: Record<string, { content: string; trace: { tool: string; args: Record<string, unknown> }[]; rounds: number }> = {};
+  const buffers: Record<string, string> = {};
+  const traces: Record<string, { tool: string; args: Record<string, unknown> }[]> = {};
+  let errMsg: string | null = null;
+
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buf += decoder.decode(value, { stream: true });
+    const lines = buf.split("\n");
+    buf = lines.pop() ?? "";
+    for (const line of lines) {
+      const t = line.trim();
+      if (!t) continue;
+      let ev: CommitteeEvent;
+      try { ev = JSON.parse(t); } catch { continue; }
+      const agent = ev.agent || "";
+      if (ev.type === "delta" && agent) {
+        buffers[agent] = (buffers[agent] || "") + ev.text!;
+        handlers.onDelta?.(agent, ev.text!);
+      } else if (ev.type === "tool" && agent) {
+        traces[agent] = [...(traces[agent] || []), { tool: ev.tool!, args: ev.args || {} }];
+        handlers.onTool?.(agent, ev.tool!, ev.args || {});
+      } else if (ev.type === "agent_done" && agent) {
+        results[agent] = { content: buffers[agent] || "", trace: traces[agent] || [], rounds: ev.rounds || 0 };
+        handlers.onAgentDone?.(agent, traces[agent] || [], ev.rounds || 0);
+      } else if (ev.type === "error") {
+        errMsg = ev.message || null;
+      }
+    }
+  }
+  if (errMsg) throw new ApiError(errMsg, 502);
+  return results;
+}

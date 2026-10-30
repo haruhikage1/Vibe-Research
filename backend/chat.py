@@ -13,7 +13,10 @@ import ipaddress
 import json
 import logging
 import os
+import queue
+import re
 import socket
+import threading
 import traceback
 from urllib.parse import urlparse
 
@@ -62,6 +65,36 @@ A 股用 query_quote / query_valuation / query_reports / query_news（传 6 位�
 
 当前页面上下文：
 {{context}}"""
+
+# 多 Agent 投研委员会 —— 人格配置
+AGENT_PERSONAS = {
+    "价值派": {
+        "focus": "估值历史分位、股息率、PB/PE 同业对比、安全边际",
+        "style": "保守，看重估值保护，关注下行风险小于上行空间",
+        "prompt_extra": "你是一个价值投资者。优先分析估值与安全边际：PE/PB/PS 的历史分位、股息率、同业估值对比、安全边际大小。判断当前价格是否提供了足够的安全垫。观点要保守——宁可错过，不要买贵。",
+    },
+    "成长派": {
+        "focus": "营收增速、利润增速、ROE 趋势、行业渗透率、市场空间",
+        "style": "乐观，看重增长质量与可持续性",
+        "prompt_extra": "你是一个成长投资者。优先分析增长趋势与质量：营收与利润增速是否匹配、ROE 趋势、行业渗透率天花板、市场空间大小。关注增长的可持续性——是短期风口还是长期趋势。",
+    },
+    "量化派": {
+        "focus": "资金面、筹码结构、量价关系、板块轮动、动量因子",
+        "style": "中性与客观，只看数据信号",
+        "prompt_extra": "你是一个量化分析师。优先分析资金面与筹码数据：主力资金流向、融资融券趋势、换手率变化、板块轮动信号。只看数据说话，不掺杂主观判断。用数字和信号强度来表述观点。",
+    },
+    "风险派": {
+        "focus": "解禁、质押、监管风险、竞争格局恶化、关联交易",
+        "style": "谨慎，只唱反调找出盲点",
+        "prompt_extra": "你是一个风险分析师。专门找出被忽视的风险点：限售解禁、大股东质押、监管政策变化、竞争格局恶化、关联交易、财务疑点。你的职责是唱反调——让用户看到乐观情绪之外的另一面。",
+    },
+    "综合派": {
+        "focus": "多空因素汇总、核心矛盾提炼、关键观测点",
+        "style": "平衡，综合多视角后给出关键观测点",
+        "prompt_extra": "你是一个首席策略分析师。综合价值、成长、量化、风险各维度信息，提炼当前最核心的投资矛盾，给出几个关键观测点（后续重点跟踪什么）。不做买卖建议，只帮助用户理清决策框架。",
+    },
+}
+DEFAULT_COMMITTEE = ["价值派", "成长派", "量化派", "风险派", "综合派"]
 
 TOOLS = [
     {
@@ -214,19 +247,24 @@ def _check_base_url(url: str) -> None:
                 raise RuntimeError("Base URL 解析到了不允许的内网地址")
 
 
+def _api_key(cfg: dict) -> str:
+    """清洗 API key：去首尾空白/引号，剥误加的 Bearer 前缀（防 Invalid authorization header）。"""
+    key = str(cfg.get("apiKey") or "").strip().strip('"').strip("'")
+    if key.lower().startswith("bearer "):
+        key = key[7:].strip()
+    return key
+
+
 def _call_llm(cfg: dict, messages: list, use_tools: bool) -> dict:
     _check_base_url(cfg.get("baseURL", ""))
-    base = cfg["baseURL"].rstrip("/")
-    if not base.endswith(("/v1", "/v3", "/api/v3")):
-        # 多数 OpenAI 兼容端点需要 /v1；已带版本段则不动。
-        base = base + "/v1"
+    base = _resolve_base(cfg)
     payload = {"model": cfg["model"], "messages": messages, "temperature": 0.3}
     if use_tools:
         payload["tools"] = TOOLS
         payload["tool_choice"] = "auto"
     r = requests.post(
         f"{base}/chat/completions",
-        headers={"Authorization": f"Bearer {cfg['apiKey']}", "Content-Type": "application/json"},
+        headers={"Authorization": f"Bearer {_api_key(cfg)}", "Content-Type": "application/json"},
         json=payload,
         timeout=90,
     )
@@ -295,7 +333,14 @@ def run_chat_cli(cfg: dict, user_messages: list, context: str = "") -> dict:
 
 def _resolve_base(cfg: dict) -> str:
     base = cfg["baseURL"].rstrip("/")
-    if not base.endswith(("/v1", "/v3", "/api/v3")):
+    # 容错：用户常把完整接口地址贴进 baseURL，剥掉尾部路径，避免拼出 /chat/completions/v1/... 的 404
+    for tail in ("/chat/completions", "/completions", "/embeddings"):
+        if base.endswith(tail):
+            base = base[: -len(tail)]
+            break
+    # 已带版本段（/v1 /v2 /v10 /api/v3…）则不动，否则补 /v1
+    last_seg = base.rsplit("/", 1)[-1].lower()
+    if not re.fullmatch(r"v\d+", last_seg):
         base = base + "/v1"
     return base
 
@@ -308,7 +353,7 @@ def _call_llm_stream(cfg: dict, messages: list, use_tools: bool):
         payload["tool_choice"] = "auto"
     r = requests.post(
         f"{_resolve_base(cfg)}/chat/completions",
-        headers={"Authorization": f"Bearer {cfg['apiKey']}", "Content-Type": "application/json"},
+        headers={"Authorization": f"Bearer {_api_key(cfg)}", "Content-Type": "application/json"},
         json=payload, timeout=120, stream=True,
     )
     if r.status_code != 200:
@@ -419,3 +464,127 @@ def run_chat_cli_stream(cfg: dict, user_messages: list, context: str = ""):
     for chunk in cli_runtime.run_cli_stream(kind, system, user):
         yield {"type": "delta", "text": chunk}
     yield {"type": "done", "trace": [], "rounds": 1}
+
+
+# ---------------------------------------------------------------------------
+# 多 Agent 投研委员会：并行 N 个 agent，事件带 agent 字段
+# ---------------------------------------------------------------------------
+
+_COMMITTEE_TOOL_CACHE: dict[str, str] = {}
+
+
+def _committee_exec_tool_cached(name: str, args: dict) -> str:
+    """带缓存的工具执行——同一参数多 agent 共用结果，避免重复拉数据。"""
+    key = json.dumps({"n": name, "a": args}, sort_keys=True, ensure_ascii=False)
+    hit = _COMMITTEE_TOOL_CACHE.get(key)
+    if hit is not None:
+        return hit
+    result = _exec_tool(name, args)
+    serialized = json.dumps(result, ensure_ascii=False)[:_TOOL_RESULT_CAP]
+    _COMMITTEE_TOOL_CACHE[key] = serialized
+    return serialized
+
+
+def _run_one_agent(cfg: dict, user_messages: list, context: str, agent_name: str, persona: dict, evq: queue.Queue):
+    """运行单个 agent 的流式对话，事件推入 evq（带 agent 字段）。"""
+    try:
+        prompt = SYSTEM_PROMPT.format(context=context or "（无）")
+        prompt += f"\n\n【你的角色】{persona['style']}\n分析侧重：{persona['focus']}\n{persona['prompt_extra']}"
+        messages = [{"role": "system", "content": prompt}]
+        messages.extend(user_messages)
+        trace: list[dict] = []
+
+        for rnd in range(1, MAX_ROUNDS + 1):
+            resp = _call_llm_stream(cfg, messages, use_tools=True)
+            content_parts: list[str] = []
+            tool_acc: dict[int, dict] = {}
+            for delta in _iter_sse_deltas(resp):
+                if delta.get("content"):
+                    content_parts.append(delta["content"])
+                    evq.put({"type": "delta", "agent": agent_name, "text": delta["content"]})
+                for tc in (delta.get("tool_calls") or []):
+                    idx = tc.get("index")
+                    if idx is None:
+                        tc_id = tc.get("id") or ""
+                        idx = next((k for k, v in tool_acc.items() if tc_id and v["id"] == tc_id), None)
+                        if idx is None:
+                            idx = len(tool_acc) if (tc_id or not tool_acc) else max(tool_acc)
+                    acc = tool_acc.setdefault(idx, {"id": "", "name": "", "arguments": ""})
+                    if tc.get("id"):
+                        acc["id"] = tc["id"]
+                    fn = tc.get("function") or {}
+                    if fn.get("name"):
+                        acc["name"] = fn["name"]
+                    if fn.get("arguments"):
+                        acc["arguments"] += fn["arguments"]
+
+            if not tool_acc:
+                evq.put({"type": "agent_done", "agent": agent_name, "trace": trace, "rounds": rnd})
+                return
+
+            messages.append({
+                "role": "assistant",
+                "content": "".join(content_parts) or None,
+                "tool_calls": [{
+                    "id": tool_acc[i]["id"], "type": "function",
+                    "function": {"name": tool_acc[i]["name"], "arguments": tool_acc[i]["arguments"]},
+                } for i in sorted(tool_acc)],
+            })
+            for i in sorted(tool_acc):
+                a = tool_acc[i]
+                try:
+                    args = json.loads(a["arguments"] or "{}")
+                except json.JSONDecodeError:
+                    args = {}
+                evq.put({"type": "tool", "agent": agent_name, "tool": a["name"], "args": args})
+                result_str = _committee_exec_tool_cached(a["name"], args)
+                trace.append({"tool": a["name"], "args": args})
+                messages.append({
+                    "role": "tool", "tool_call_id": a["id"],
+                    "content": result_str,
+                })
+
+        data = _call_llm(cfg, messages, use_tools=False)
+        evq.put({"type": "delta", "agent": agent_name, "text": data["choices"][0]["message"].get("content") or ""})
+        evq.put({"type": "agent_done", "agent": agent_name, "trace": trace, "rounds": MAX_ROUNDS})
+    except Exception as e:
+        logger.error("Agent %s 失败：%s", agent_name, e)
+        evq.put({"type": "error", "agent": agent_name, "message": f"Agent {agent_name} 失败：{e}"})
+    finally:
+        evq.put(("_SENTINEL", agent_name))
+
+
+def run_chat_committee_stream(cfg: dict, user_messages: list, context: str = "", agents: list[str] | None = None):
+    """多 Agent 投研委员会流式：并行运行 N 个 agent，事件带 agent 字段。
+
+    各 agent 共享同一份 context，工具调用结果带缓存避免重复拉数据。
+    前端按 agent 字段分离渲染。
+    """
+    agent_list = agents or DEFAULT_COMMITTEE
+    _COMMITTEE_TOOL_CACHE.clear()
+    evq: queue.Queue = queue.Queue()
+    active: list[threading.Thread] = []
+
+    for name in agent_list:
+        persona = AGENT_PERSONAS.get(name)
+        if not persona:
+            evq.put({"type": "error", "agent": name, "message": f"未知 agent：{name}"})
+            evq.put(("_SENTINEL", name))
+            continue
+        t = threading.Thread(
+            target=_run_one_agent,
+            args=(cfg, user_messages, context, name, persona, evq),
+            daemon=True,
+        )
+        t.start()
+        active.append((name, t))
+
+    done_set: set[str] = set()
+    while len(done_set) < len(agent_list):
+        ev = evq.get()
+        if isinstance(ev, tuple) and ev[0] == "_SENTINEL":
+            done_set.add(ev[1])
+            continue
+        yield ev
+
+    yield {"type": "done", "agents": agent_list}

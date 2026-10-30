@@ -1,14 +1,14 @@
 import { useState, useEffect } from "react";
 import { Link } from "react-router-dom";
-import { Sparkles, Loader2, AlertCircle, RefreshCw, Gauge, ArrowDownUp, TrendingUp, TrendingDown, Plus, X, Flame, BarChart3, Globe } from "lucide-react";
+import { Sparkles, Loader2, AlertCircle, RefreshCw, Gauge, ArrowDownUp, TrendingUp, TrendingDown, Plus, X, Flame, BarChart3, Globe, BookOpen, BrainCircuit, Satellite } from "lucide-react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { PageHeader } from "@/components/ui/PageHeader";
 import { GlassCard } from "@/components/ui/GlassCard";
 import { AskAiButton } from "@/components/ui/AskAiButton";
 import { Disclaimer } from "@/components/ui/Disclaimer";
-import { api, ApiError, type IndexQuote, type Quote, type MarketOverview, type ShortTermEmotion, type TurnoverTop, type GlobalIndex } from "@/lib/api";
-import { hasLlm, chatStream } from "@/lib/llm";
+import { api, ApiError, type IndexQuote, type Quote, type MarketOverview, type ShortTermEmotion, type TurnoverTop, type GlobalIndex, type DailyBrief, type CrossSignalData } from "@/lib/api";
+import { hasLlm, loadLlm, chatStream } from "@/lib/llm";
 import { SaveNoteButton } from "@/components/ui/SaveNoteButton";
 import { loadWatch, saveWatch, addCodes } from "@/lib/watchlist";
 import { cn } from "@/lib/utils";
@@ -35,6 +35,11 @@ export function DailyReview() {
   const [watchQuotes, setWatchQuotes] = useState<Record<string, Quote>>({});
   const [watchInput, setWatchInput] = useState("");
   const [watchLoading, setWatchLoading] = useState(false);
+  const [dailyBrief, setDailyBrief] = useState<DailyBrief | null>(null);
+  const [briefLoading, setBriefLoading] = useState(false);
+  const [briefErr, setBriefErr] = useState<string | null>(null);
+  const [commentaryLoading, setCommentaryLoading] = useState(false);
+  const [crossSignals, setCrossSignals] = useState<CrossSignalData | null>(null);
 
   // 各数据块请求是否已结束：区分「加载中」与「数据源暂不可用」（非交易时段/被限流时后端返回空）
   const [ovDone, setOvDone] = useState(false);
@@ -47,6 +52,7 @@ export function DailyReview() {
     api.marketOverview().then(setOverview).catch(() => {}).finally(() => setOvDone(true));
     api.emotion().then(setEmotion).catch(() => {}).finally(() => setEmoDone(true));
     api.turnoverTop().then(setTurnover).catch(() => {}).finally(() => setToDone(true));
+    api.crossMarketSignals().then(setCrossSignals).catch(() => {});
   };
 
   // 数据块占位：请求没回来 = 加载中；回来了但为空 = 数据源暂不可用（别让用户干等）
@@ -107,6 +113,38 @@ export function DailyReview() {
     }
   };
 
+  const generateBrief = async () => {
+    setBriefErr(null);
+    if (!hasLlm()) { setBriefErr("请先接入 AI"); return; }
+    setBriefLoading(true);
+    setDailyBrief(null);
+    try {
+      const llm = loadLlm();
+      const codes = loadWatch();
+      const brief = await api.dailyBriefGenerate(codes, llm || undefined);
+      setDailyBrief(brief);
+    } catch (e) {
+      setBriefErr(e instanceof ApiError ? e.message : "生成复盘录失败");
+    } finally {
+      setBriefLoading(false);
+    }
+  };
+
+  const generateCommentary = async () => {
+    if (!dailyBrief) return;
+    setCommentaryLoading(true);
+    try {
+      const llm = loadLlm();
+      if (!llm) { setBriefErr("请先接入 AI"); return; }
+      const updated = await api.dailyBriefCommentary(llm);
+      setDailyBrief(updated);
+    } catch (e) {
+      setBriefErr(e instanceof ApiError ? e.message : "AI 简评生成失败");
+    } finally {
+      setCommentaryLoading(false);
+    }
+  };
+
   const sentiment = overview?.sentiment;
   const sectors = overview?.sectors || [];
   const sentCells = sentiment ? [
@@ -134,6 +172,126 @@ export function DailyReview() {
           />
         }
       />
+
+      {/* 0. 投资复盘录 */}
+      <GlassCard glow className="mb-6">
+        <div className="flex items-center justify-between">
+          <h3 className="flex items-center gap-1.5 font-semibold"><BookOpen className="h-4 w-4 text-primary" /> 今日投资日志</h3>
+          <div className="flex items-center gap-2">
+            {dailyBrief && (dailyBrief as any).ai_commentary_status !== "done" && (
+              <button onClick={generateCommentary} disabled={commentaryLoading}
+                className="inline-flex items-center gap-1.5 rounded-lg bg-primary/10 px-3 py-1.5 text-xs font-medium text-primary hover:bg-primary/20 disabled:opacity-50">
+                {commentaryLoading ? <Loader2 className="h-3 w-3 animate-spin" /> : <BrainCircuit className="h-3 w-3" />}
+                生成 AI 简评
+              </button>
+            )}
+            <button onClick={generateBrief} disabled={briefLoading}
+              className="inline-flex items-center gap-1.5 rounded-lg bg-primary/15 px-3 py-1.5 text-xs font-medium text-primary hover:bg-primary/25 disabled:opacity-50">
+              {briefLoading ? <Loader2 className="h-3 w-3 animate-spin" /> : <BookOpen className="h-3 w-3" />}
+              {dailyBrief ? "刷新" : "生成今日复盘录"}
+            </button>
+          </div>
+        </div>
+        {briefErr && (
+          <div className="mt-3 flex items-center gap-2 rounded-lg border border-destructive/30 bg-destructive/5 p-2 text-xs text-destructive">
+            <AlertCircle className="h-3.5 w-3.5 shrink-0" /> {briefErr}
+          </div>
+        )}
+        {!dailyBrief ? (
+          !briefLoading && (
+            <p className="mt-3 text-sm text-muted-foreground">
+              点击「生成今日复盘录」，系统聚合大盘、自选、持仓、资讯数据，自动生成一份结构化投资日志，可保存为历史记录。
+            </p>
+          )
+        ) : (
+          <div className="mt-4 space-y-3 text-sm">
+            {/* 大盘概览 */}
+            {dailyBrief.indices.length > 0 && (
+              <div className="rounded-lg bg-muted/20 p-3">
+                <p className="mb-1 text-xs font-semibold text-muted-foreground">📊 大盘</p>
+                <div className="flex flex-wrap gap-x-4 gap-y-1">
+                  {dailyBrief.indices.map((i) => (
+                    <span key={i.name} className="text-xs">
+                      {i.name} <span className={cn("font-mono font-medium", i.change_pct > 0 ? "text-danger" : i.change_pct < 0 ? "text-success" : "")}>
+                        {i.price}（{i.change_pct > 0 ? "+" : ""}{i.change_pct}%）
+                      </span>
+                    </span>
+                  ))}
+                </div>
+              </div>
+            )}
+
+            {/* 自选股动态 */}
+            {dailyBrief.watchlist.length > 0 && (
+              <div className="rounded-lg bg-muted/20 p-3">
+                <p className="mb-1 text-xs font-semibold text-muted-foreground">⭐ 自选股动态</p>
+                <div className="space-y-0.5">
+                  {dailyBrief.watchlist.map((w) => (
+                    <p key={w.code} className="text-xs">
+                      {w.name} <span className={cn("font-mono", w.change_pct > 0 ? "text-danger" : w.change_pct < 0 ? "text-success" : "")}>
+                        {w.price}（{w.change_pct > 0 ? "+" : ""}{w.change_pct}%）
+                      </span>
+                    </p>
+                  ))}
+                </div>
+              </div>
+            )}
+
+            {/* 持仓 */}
+            {dailyBrief.portfolio.holdings.length > 0 && (
+              <div className="rounded-lg bg-muted/20 p-3">
+                <p className="mb-1 text-xs font-semibold text-muted-foreground">💼 持仓</p>
+                <p className="text-xs text-muted-foreground/70">
+                  今日盈亏：<span className={cn("font-mono font-medium", (dailyBrief.portfolio.totals as any).pnl > 0 ? "text-danger" : (dailyBrief.portfolio.totals as any).pnl < 0 ? "text-success" : "")}>
+                    {(dailyBrief.portfolio.totals as any).pnl > 0 ? "+" : ""}{(dailyBrief.portfolio.totals as any).pnl?.toFixed?.(2) ?? "—"} 元
+                  </span>
+                  · 仓位：{(dailyBrief.portfolio.holdings).length} 只
+                </p>
+                {dailyBrief.portfolio.holdings.map((h) => (
+                  <p key={h.code} className="text-xs text-muted-foreground/70">
+                    {h.name}（{h.code}）盈亏 <span className={cn("font-mono", h.pnl > 0 ? "text-danger" : h.pnl < 0 ? "text-success" : "")}>{h.pnl > 0 ? "+" : ""}{h.pnl} 元</span>
+                  </p>
+                ))}
+              </div>
+            )}
+
+            {/* 相关资讯 */}
+            {dailyBrief.news_highlights.length > 0 && (
+              <div className="rounded-lg bg-muted/20 p-3">
+                <p className="mb-1 text-xs font-semibold text-muted-foreground">📡 相关资讯</p>
+                <div className="space-y-0.5">
+                  {dailyBrief.news_highlights.slice(0, 6).map((n, i) => (
+                    <p key={i} className="truncate text-xs text-muted-foreground/70">
+                      <span className="text-muted-foreground/50">[{n.industry}]</span> {n.title}
+                    </p>
+                  ))}
+                </div>
+              </div>
+            )}
+
+            {/* AI 简评 */}
+            {(dailyBrief as any).ai_commentary && (
+              <div className="rounded-lg border border-primary/20 bg-primary/5 p-3">
+                <p className="mb-1.5 flex items-center gap-1.5 text-xs font-semibold text-primary">
+                  <Sparkles className="h-3 w-3" /> AI 简评
+                </p>
+                <div className="prose prose-xs prose-invert max-w-none text-xs text-foreground/80">
+                  <ReactMarkdown remarkPlugins={[remarkGfm]}>{(dailyBrief as any).ai_commentary}</ReactMarkdown>
+                </div>
+                <div className="mt-2">
+                  <SaveNoteButton kind="复盘" title={`每日复盘 ${dailyBrief.date}`} content={(dailyBrief as any).ai_commentary} />
+                </div>
+              </div>
+            )}
+
+            {commentaryLoading && (
+              <div className="flex items-center gap-2 text-xs text-muted-foreground">
+                <Loader2 className="h-3 w-3 animate-spin" /> AI 正在生成简评…
+              </div>
+            )}
+          </div>
+        )}
+      </GlassCard>
 
       {/* 1. 大盘指数（实时） */}
       <div className="mb-3 flex items-center justify-between">
@@ -174,6 +332,93 @@ export function DailyReview() {
                 </p>
               </GlassCard>
             ))}
+          </div>
+        </>
+      )}
+
+      {/* 1c. 跨境信号映射 */}
+      {crossSignals && crossSignals.signals.length > 0 && (
+        <>
+          <div className="mb-3 flex items-center gap-2">
+            <h3 className="flex items-center gap-1.5 text-sm font-semibold text-muted-foreground">
+              <Satellite className="h-4 w-4" /> 跨境信号映射
+            </h3>
+            <span className="text-[11px] text-muted-foreground/50">美港股异动 → A 股联动预警</span>
+            {crossSignals.active_count > 0 && (
+              <span className="ml-auto rounded-full bg-danger/15 px-2 py-0.5 text-[10px] font-medium text-danger">
+                {crossSignals.active_count} 个活跃信号
+              </span>
+            )}
+          </div>
+          <div className="mb-6 space-y-2">
+            {crossSignals.signals.filter((s) => s.is_active).length > 0 && (
+              <div className="space-y-2">
+                {crossSignals.signals.filter((s) => s.is_active).map((sig) => (
+                  <GlassCard key={sig.symbol} className={cn("p-3", sig.change_pct! > 0 ? "border-danger/20" : "border-success/20")}>
+                    <div className="flex items-center justify-between">
+                      <div className="flex items-center gap-2">
+                        <span className={cn("font-semibold", sig.change_pct! > 0 ? "text-danger" : "text-success")}>
+                          {sig.name} ({sig.symbol})
+                        </span>
+                        <span className={cn("font-mono text-sm font-bold", sig.change_pct! > 0 ? "text-danger" : "text-success")}>
+                          {sig.change_pct! > 0 ? "+" : ""}{sig.change_pct}%
+                        </span>
+                        <span className="text-[11px] text-muted-foreground/50">{sig.market} · {sig.lag}</span>
+                      </div>
+                      {sig.sync_rate != null && (
+                        <span className="text-[11px] text-muted-foreground/60">
+                          联动强度 ρ={sig.sync_rate.toFixed(2)}
+                        </span>
+                      )}
+                    </div>
+                    <div className="mt-2 grid grid-cols-1 gap-2 sm:grid-cols-3">
+                      {sig.sectors.map((sec) => (
+                        <div key={sec.name} className="rounded-lg bg-muted/15 p-2">
+                          <div className="flex items-center justify-between">
+                            <span className="text-xs font-medium text-foreground/80">{sec.name}</span>
+                            {sec.change_pct != null && (
+                              <span className={cn("font-mono text-xs", sec.change_pct > 0 ? "text-danger" : "text-success")}>
+                                {sec.change_pct > 0 ? "+" : ""}{sec.change_pct}%
+                              </span>
+                            )}
+                          </div>
+                          {sec.stocks.length > 0 && (
+                            <div className="mt-1 space-y-0.5">
+                              {sec.stocks.map((st) => (
+                                <div key={st.code} className="flex items-center justify-between text-[11px]">
+                                  <span className="text-muted-foreground/70">{st.name}</span>
+                                  <span className={cn("font-mono", st.change_pct != null ? (st.change_pct > 0 ? "text-danger" : "text-success") : "text-muted-foreground/40")}>
+                                    {st.change_pct != null ? `${st.change_pct > 0 ? "+" : ""}${st.change_pct}%` : "—"}
+                                  </span>
+                                </div>
+                              ))}
+                            </div>
+                          )}
+                        </div>
+                      ))}
+                    </div>
+                  </GlassCard>
+                ))}
+              </div>
+            )}
+            {/* 非活跃信号（折叠显示） */}
+            {crossSignals.signals.filter((s) => !s.is_active).length > 0 && (
+              <details className="group">
+                <summary className="cursor-pointer text-xs text-muted-foreground/60 hover:text-muted-foreground">
+                  其他监测标的（{crossSignals.signals.filter((s) => !s.is_active).length} 个）
+                </summary>
+                <div className="mt-1 grid grid-cols-2 gap-1.5 sm:grid-cols-4">
+                  {crossSignals.signals.filter((s) => !s.is_active).map((sig) => (
+                    <div key={sig.symbol} className="rounded-lg bg-muted/10 p-2 text-xs">
+                      <span className="text-muted-foreground/80">{sig.name}</span>
+                      <span className={cn("ml-1 font-mono", sig.change_pct! > 0 ? "text-danger" : sig.change_pct! < 0 ? "text-success" : "text-muted-foreground/40")}>
+                        {sig.change_pct! > 0 ? "+" : ""}{sig.change_pct}%
+                      </span>
+                    </div>
+                  ))}
+                </div>
+              </details>
+            )}
           </div>
         </>
       )}

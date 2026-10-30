@@ -23,7 +23,11 @@ import astock
 import chat as chat_layer
 import cli_runtime
 import conversations
+import cross_market
+import daily_brief
 import gstock
+import scenario
+import screener
 import newsradar
 import portfolio as pf
 import market
@@ -126,6 +130,207 @@ def chat(req: ChatReq):
             yield json.dumps({"type": "error", "message": f"对话失败：{e}"}, ensure_ascii=False) + "\n"
 
     return StreamingResponse(gen(), media_type="application/x-ndjson")
+
+
+class CommitteeReq(BaseModel):
+    messages: list[dict]
+    context: str = ""
+    llm: LLMConfig
+    agents: list[str] = []
+
+
+@app.post("/api/chat/committee")
+def chat_committee(req: CommitteeReq):
+    """多 Agent 投研委员会：并行运行 N 个不同风格的 AI agent，流式 NDJSON。
+
+    每个事件带 `agent` 字段标识来源，前端可据此分列渲染。
+    各 agent 共享同一份 context，工具调用结果带缓存避免重复拉数据。
+    """
+    if not req.messages:
+        raise HTTPException(400, "messages 不能为空")
+    if not req.llm.model:
+        raise HTTPException(400, "缺少模型配置，请先在「接入 AI」里选择")
+    if not req.agents:
+        req.agents = chat_layer.DEFAULT_COMMITTEE
+    if not req.llm.apiKey or not req.llm.baseURL:
+        raise HTTPException(400, "缺少 Base URL 或 API Key，请先在「接入 AI」里填写")
+
+    cfg = req.llm.model_dump() if hasattr(req.llm, "model_dump") else req.llm.dict()
+
+    def gen():
+        try:
+            events = chat_layer.run_chat_committee_stream(cfg, req.messages, req.context, req.agents)
+            for ev in events:
+                yield json.dumps(ev, ensure_ascii=False) + "\n"
+        except Exception as e:  # noqa: BLE001
+            logger.error("委员会对话失败：%s\n%s", e, traceback.format_exc())
+            yield json.dumps({"type": "error", "message": f"委员会对话失败：{e}"}, ensure_ascii=False) + "\n"
+
+    return StreamingResponse(gen(), media_type="application/x-ndjson")
+
+
+class DailyBriefReq(BaseModel):
+    watch_codes: list[str] = []
+    llm: LLMConfig | None = None
+
+
+class DailyBriefCommentaryReq(BaseModel):
+    llm: LLMConfig
+
+
+@app.post("/api/daily-brief/generate")
+def daily_brief_generate(req: DailyBriefReq):
+    """生成今日投资复盘录：聚合市场、持仓、自选、资讯数据，可选生成 AI 简评。
+
+    返回完整的复盘录 JSON。如果有 llm 配置，会自动调用 AI 生成简评。
+    """
+    try:
+        log = daily_brief.generate_brief(watch_codes=req.watch_codes)
+        if req.llm and req.llm.model and req.llm.apiKey and req.llm.baseURL:
+            cfg = req.llm.model_dump() if hasattr(req.llm, "model_dump") else req.llm.dict()
+            daily_brief.generate_ai_commentary(log, cfg)
+        return {"data": log}
+    except Exception as e:
+        logger.error("生成复盘录失败：%s\n%s", e, traceback.format_exc())
+        raise HTTPException(502, f"生成复盘录失败：{e}") from e
+
+
+@app.post("/api/daily-brief/commentary")
+def daily_brief_commentary(req: DailyBriefCommentaryReq):
+    """为今日复盘录生成/刷新 AI 简评（需 LLM 配置）。"""
+    if not req.llm.model or not req.llm.apiKey or not req.llm.baseURL:
+        raise HTTPException(400, "缺少 AI 配置")
+    try:
+        log = daily_brief.get_brief()
+        if not log:
+            raise HTTPException(404, "今天还没有生成复盘录，请先生成")
+        cfg = req.llm.model_dump() if hasattr(req.llm, "model_dump") else req.llm.dict()
+        daily_brief.generate_ai_commentary(log, cfg)
+        return {"data": daily_brief.get_brief()}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error("AI 简评生成失败：%s\n%s", e, traceback.format_exc())
+        raise HTTPException(502, f"AI 简评生成失败：{e}") from e
+
+
+@app.get("/api/daily-brief")
+def daily_brief_get(date: str = Query(None)):
+    """取指定日期的复盘录。date=YYYY-MM-DD，默认今天。"""
+    log = daily_brief.get_brief(date=date)
+    if not log:
+        raise HTTPException(404, f"未找到{'今天' if not date else date}的复盘录")
+    return {"data": log}
+
+
+@app.get("/api/daily-brief/history")
+def daily_brief_history():
+    """历史复盘录列表（倒序）。"""
+    return {"data": daily_brief.list_briefs()}
+
+
+class ScreenerReq(BaseModel):
+    query: str
+    llm: LLMConfig
+
+
+@app.post("/api/screener")
+def screener_run(req: ScreenerReq):
+    """自然语言筛选器：NL → 结构化条件 → 逐层过滤 → 结果表格。
+
+    请求体包含用户的自然语言查询和 LLM 配置（用于解析条件）。
+    返回筛选结果 + 筛选链路日志（前端展示每一步做了什么）。
+    """
+    if not req.query.strip():
+        raise HTTPException(400, "筛选条件不能为空")
+    if not req.llm.model or not req.llm.apiKey or not req.llm.baseURL:
+        raise HTTPException(400, "缺少 AI 配置，条件解析需要 LLM")
+    cfg = req.llm.model_dump() if hasattr(req.llm, "model_dump") else req.llm.dict()
+    try:
+        result = screener.screening_pipeline(req.query, cfg)
+        if "error" in result:
+            raise HTTPException(400, result["error"])
+        return {"data": result}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error("筛选失败：%s\n%s", e, traceback.format_exc())
+        raise HTTPException(502, f"筛选失败：{e}") from e
+
+
+@app.get("/api/cross-market/signals")
+def cross_market_signals():
+    """跨境信号映射：检测美港股异动 → 匹配关联 A 股板块/个股行情。
+
+    返回当前所有监控标的的行情 + 关联板块涨跌 + 代表个股行情。
+    |涨跌幅| >= 2% 标记为活跃信号。
+    """
+    try:
+        return {"data": cross_market.get_active_signals()}
+    except Exception as e:  # noqa: BLE001
+        logger.error("跨境信号异常：%s\n%s", e, traceback.format_exc())
+        raise HTTPException(502, f"跨境信号异常：{e}") from e
+
+
+@app.get("/api/cross-market/correlation")
+def cross_market_correlation():
+    """联动强度摘要：美股/港股 → A 股板块联动关系列表。"""
+    try:
+        return {"data": cross_market.get_correlation_summary()}
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(502, f"联动强度异常：{e}") from e
+
+
+@app.get("/api/scenario/defaults")
+def scenario_defaults(code: str = Query(...)):
+    """假设沙盒基准值：当前财务 + 估值，供前端面板预填。"""
+    code = _validate(code)
+    try:
+        return {"data": scenario.get_scenario_defaults(code)}
+    except ValueError as e:
+        raise HTTPException(404, str(e)) from e
+    except astock.DependencyMissing as e:
+        raise HTTPException(501, str(e)) from e
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(502, f"假设基准值异常：{e}") from e
+
+
+class ScenarioReq(BaseModel):
+    code: str
+    revenue_growth: float | None = None
+    gross_margin: float | None = None
+    op_expense_ratio: float | None = None
+    target_pe: float | None = None
+    peg_threshold: float | None = None
+    llm: LLMConfig | None = None
+
+
+@app.post("/api/scenario")
+def scenario_compute(req: ScenarioReq):
+    """假设沙盒：按用户假设重算估值，可选生成 AI 点评。"""
+    code = _validate(req.code)
+    cfg = None
+    if req.llm and req.llm.model and req.llm.apiKey and req.llm.baseURL:
+        cfg = req.llm.model_dump() if hasattr(req.llm, "model_dump") else req.llm.dict()
+    try:
+        adjustments = {
+            "revenue_growth": req.revenue_growth,
+            "gross_margin": req.gross_margin,
+            "op_expense_ratio": req.op_expense_ratio,
+            "target_pe": req.target_pe,
+            "peg_threshold": req.peg_threshold,
+        }
+        result = scenario.compute_scenario(code, adjustments, llm_cfg=cfg)
+        if "error" in result:
+            raise HTTPException(400, result["error"])
+        return {"data": result}
+    except HTTPException:
+        raise
+    except astock.DependencyMissing as e:
+        raise HTTPException(501, str(e)) from e
+    except Exception as e:  # noqa: BLE001
+        logger.error("假设计算异常：%s\n%s", e, traceback.format_exc())
+        raise HTTPException(502, f"假设计算异常：{e}") from e
 
 
 class HoldingIn(BaseModel):

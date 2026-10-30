@@ -252,6 +252,139 @@ export interface GlobalStock {
   quote: GlobalQuote; metrics: GlobalMetrics | null;
 }
 
+// ---- 跨境信号映射 ----
+export interface CrossStock {
+  code: string; name: string; price: number | null; change_pct: number | null;
+}
+export interface CrossSector {
+  name: string; change_pct: number | null;
+  stocks: CrossStock[];
+}
+export interface CrossSignal {
+  symbol: string; name: string; market: string;
+  price: number | null; change_pct: number | null;
+  direction: string; is_active: boolean; lag: string;
+  sync_rate: number | null;
+  sectors: CrossSector[];
+}
+export interface CrossSignalData {
+  signals: CrossSignal[]; total: number; active_count: number; updated: string;
+}
+export interface CrossCorrelation {
+  us_symbol: string; us_name: string; sector: string; lag: string; sync_rate: number | null;
+}
+
+// ---- 投资假设沙盒 ----
+export interface ScenarioDefaults {
+  code: string; name: string; period: string | null;
+  price: number; pe_ttm: number | null; mcap_yi: number | null; shares_yi: number | null;
+  revenue_yi: number | null; net_profit_yi: number | null; revenue_yoy: number | null;
+  gross_margin: number | null; net_margin: number | null; op_expense_ratio: number | null;
+  analyst_count: number;
+  defaults: {
+    revenue_growth: number | null; gross_margin: number | null; op_expense_ratio: number | null;
+    target_pe: number | null; peg_threshold: number;
+  };
+}
+export interface ScenarioResult {
+  code: string; name: string;
+  scenario: { revenue_growth: number; gross_margin: number; op_expense_ratio: number; target_pe: number; peg_threshold: number };
+  base: {
+    price: number; revenue_yi: number | null; net_profit_yi: number | null;
+    gross_margin: number | null; net_margin: number | null; op_expense_ratio: number | null; pe_ttm: number | null;
+  };
+  projected: { revenue_yi: number; net_profit_yi: number; net_margin: number; eps: number | null };
+  valuation: {
+    implied_pe: number; implied_price: number | null; upside_pct: number | null;
+    profit_growth_pct: number | null; scenario_peg: number | null; peg_threshold: number;
+  };
+  ai_commentary: string;
+  ai_commentary_status: string;
+  error?: string;
+}
+
+// ---- 投资复盘录 ----
+export interface DailyBriefIndex {
+  name: string; price: number; change_pct: number;
+}
+export interface DailyBriefGlobalIndex {
+  name: string; region: string; price: number | null; change_pct: number | null;
+}
+export interface DailyBriefSentiment {
+  up: number; down: number; zt: number; dt: number; breadth: string; speculation: string;
+}
+export interface DailyBriefEmotion {
+  zt_count: number; dt_count: number; max_boards: number; lianban_count: number;
+  seal_rate: number | null; break_rate: number | null;
+}
+export interface DailyBriefSector {
+  name: string; pct: number; net: number;
+}
+export interface DailyBriefTurnover {
+  name: string; pct: number | null; amount: number | null;
+}
+export interface DailyBriefHolding {
+  code: string; name: string; pnl: number; pnl_pct: number;
+}
+export interface DailyBriefPortfolio {
+  holdings: DailyBriefHolding[];
+  totals: { market_value: number; cost: number; pnl: number; pnl_pct: number };
+  realized_pnl: number;
+}
+export interface DailyBriefWatchItem {
+  code: string; name: string; price: number; change_pct: number;
+}
+export interface DailyBriefNewsItem {
+  industry: string; title: string; source: string; time: string;
+}
+export interface DailyBrief {
+  date: string; generated_at: string;
+  indices: DailyBriefIndex[];
+  global_indices: DailyBriefGlobalIndex[];
+  sentiment: DailyBriefSentiment | {};
+  emotion: DailyBriefEmotion | {};
+  sectors_top: DailyBriefSector[];
+  turnover_top: DailyBriefTurnover[];
+  portfolio: DailyBriefPortfolio;
+  watchlist: DailyBriefWatchItem[];
+  news_highlights: DailyBriefNewsItem[];
+  ai_commentary: string;
+  ai_commentary_status: string;
+}
+export interface DailyBriefListItem {
+  date: string; generated_at: string; has_commentary: boolean;
+  indices_count: number; holdings_count: number;
+}
+
+// ---- 自然语言筛选器 ----
+export interface ScreenerCriteria {
+  industry?: string;
+  concept?: string;
+  filters?: { field: string; value: unknown }[];
+  error?: string;
+}
+export interface ScreenerPipelineStep {
+  step: string;
+  count?: number;
+  input_count?: number;
+  output_count?: number;
+  conditions?: string[];
+  industry?: string;
+  error?: string;
+}
+export interface ScreenerStock {
+  code: string; name: string; price: number; change_pct: number;
+  pe_ttm: number | null; pb: number | null;
+  mcap_yi: number | null; turnover_pct: number | null;
+}
+export interface ScreenerResult {
+  criteria: ScreenerCriteria;
+  results: ScreenerStock[];
+  total: number;
+  pipeline: ScreenerPipelineStep[];
+  error?: string;
+}
+
 export const api = {
   health: () => get<{ ok: boolean }>("/health"),
   indices: () => get<IndexQuote[]>("/indices"),
@@ -260,6 +393,14 @@ export const api = {
   turnoverTop: () => get<TurnoverTop>("/market/turnover-top"),
   globalIndices: () => get<GlobalIndex[]>("/global/indices"),
   globalStock: (symbol: string) => get<GlobalStock>(`/global/stock?symbol=${encodeURIComponent(symbol)}`),
+  crossMarketSignals: () => get<CrossSignalData>("/cross-market/signals"),
+  crossMarketCorrelation: () => get<CrossCorrelation[]>("/cross-market/correlation"),
+  scenarioDefaults: (code: string) => get<ScenarioDefaults>(`/scenario/defaults?code=${code}`),
+  scenarioCompute: (
+    code: string,
+    adj: { revenue_growth: number | null; gross_margin: number | null; op_expense_ratio: number | null; target_pe: number | null; peg_threshold: number | null },
+    llm?: any,
+  ) => request<ScenarioResult>("/scenario", "POST", { code, ...adj, llm }),
   radar: () => get<RadarData>("/radar"),
   radarRefresh: () => request<RadarData>("/radar/refresh", "POST"),
   portfolio: () => get<PortfolioData>("/portfolio"),
@@ -294,6 +435,17 @@ export const api = {
   ragStatus: () => get<RagStatus>("/rag/status"),
   ragReindex: () => request<{ reindexed: number; details: { report_id: string; chunks: number; skipped: string | null }[] }>("/rag/reindex", "POST"),
   ragIndexOne: (id: string) => request<{ report_id: string; chunks: number; skipped: string | null }>(`/rag/index/${id}`, "POST"),
+  // ---- 投资复盘录 ----
+  dailyBriefGenerate: (watchCodes: string[], llm?: any) =>
+    request<DailyBrief>("/daily-brief/generate", "POST", { watch_codes: watchCodes, llm }),
+  dailyBriefCommentary: (llm: any) =>
+    request<DailyBrief>("/daily-brief/commentary", "POST", { llm }),
+  dailyBriefGet: (date?: string) => get<DailyBrief>(`/daily-brief${date ? `?date=${date}` : ""}`),
+  dailyBriefHistory: () => get<DailyBriefListItem[]>("/daily-brief/history"),
+
+  screenerRun: (query: string, llm: any) =>
+    request<ScreenerResult>("/screener", "POST", { query, llm }),
+
   conversations: (page?: string) => get<ConversationListItem[]>(`/conversations${page ? `?page=${page}` : ""}`),
   conversation: (id: string) => get<Conversation>(`/conversations/${id}`),
   createConversation: (page: string, context: string, firstMessage: string) =>

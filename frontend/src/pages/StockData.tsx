@@ -1,7 +1,7 @@
 import { useRef, useState } from "react";
 import {
   Search, FileText, Newspaper, Loader2, AlertCircle, LineChart, BarChart3, Megaphone,
-  Wallet, Trophy, CalendarClock, Boxes, MessageSquare,
+  Wallet, Trophy, CalendarClock, Boxes, MessageSquare, FlaskConical, BrainCircuit, ChevronDown,
 } from "lucide-react";
 import { PageHeader } from "@/components/ui/PageHeader";
 import { GlassCard } from "@/components/ui/GlassCard";
@@ -12,8 +12,9 @@ import {
   api, ApiError, type Valuation, type Report, type NewsItem, type ValPercentile, type ValMetric,
   type Financials, type Announcement, type MarginRow, type BlockTradeRow, type HolderRow,
   type DividendRow, type FundFlowRow, type DragonTiger, type Lockup, type Blocks, type HotConcept, type QaRow,
-  type GlobalStock,
+  type GlobalStock, type ScenarioDefaults, type ScenarioResult,
 } from "@/lib/api";
+import { hasLlm, loadLlm } from "@/lib/llm";
 import { cn } from "@/lib/utils";
 
 // 金额格式化（后端资金单位：元 / 万元）
@@ -74,6 +75,176 @@ function ValBand({ label, m }: { label: string; m: ValMetric }) {
         <span>低 {m.min}</span><span>20% {m.p20}</span><span>中 {m.p50}</span><span>80% {m.p80}</span><span>高 {m.max}</span>
       </div>
     </div>
+  );
+}
+
+// 假设分析沙盒：调整财务假设 → 重算估值 → AI 点评假设合理性（可逆计算，不荐股）
+function ScenarioPanel({ code }: { code: string }) {
+  const [open, setOpen] = useState(false);
+  const [defs, setDefs] = useState<ScenarioDefaults | null>(null);
+  const [defsErr, setDefsErr] = useState<string | null>(null);
+  const [form, setForm] = useState({ revenue_growth: "", gross_margin: "", op_expense_ratio: "", target_pe: "", peg_threshold: "1.5" });
+  const [result, setResult] = useState<ScenarioResult | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [aiLoading, setAiLoading] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+
+  const numOrNull = (s: string) => {
+    const v = parseFloat(s);
+    return Number.isFinite(v) ? v : null;
+  };
+
+  const loadDefaults = () => {
+    api.scenarioDefaults(code)
+      .then((d) => {
+        setDefs(d);
+        setForm({
+          revenue_growth: d.defaults.revenue_growth?.toString() ?? "",
+          gross_margin: d.defaults.gross_margin?.toString() ?? "",
+          op_expense_ratio: d.defaults.op_expense_ratio?.toString() ?? "",
+          target_pe: d.defaults.target_pe?.toString() ?? "",
+          peg_threshold: d.defaults.peg_threshold?.toString() ?? "1.5",
+        });
+      })
+      .catch((e) => setDefsErr(e instanceof ApiError ? e.message : "基准数据加载失败"));
+  };
+
+  const toggle = () => {
+    const next = !open;
+    setOpen(next);
+    if (next && !defs && !defsErr) loadDefaults();
+  };
+
+  const compute = (withAi: boolean) => {
+    if (loading || aiLoading) return;
+    if (withAi && !hasLlm()) { setErr("请先接入 AI"); return; }
+    setErr(null);
+    if (withAi) setAiLoading(true); else setLoading(true);
+    const llm = withAi ? loadLlm() || undefined : undefined;
+    api.scenarioCompute(code, {
+      revenue_growth: numOrNull(form.revenue_growth),
+      gross_margin: numOrNull(form.gross_margin),
+      op_expense_ratio: numOrNull(form.op_expense_ratio),
+      target_pe: numOrNull(form.target_pe),
+      peg_threshold: numOrNull(form.peg_threshold),
+    }, llm)
+      .then((r) => {
+        if (r.error) { setErr(r.error); return; }
+        setResult(r);
+      })
+      .catch((e) => setErr(e instanceof ApiError ? e.message : "计算失败"))
+      .finally(() => { setLoading(false); setAiLoading(false); });
+  };
+
+  const baseHint = (k: keyof ScenarioDefaults["defaults"]) =>
+    defs?.defaults[k] != null ? `实际值 ${defs.defaults[k]}` : "无基准";
+
+  const inputs: { key: keyof typeof form; label: string; unit: string; hintKey: keyof ScenarioDefaults["defaults"] }[] = [
+    { key: "revenue_growth", label: "营收增速", unit: "%", hintKey: "revenue_growth" },
+    { key: "gross_margin", label: "毛利率", unit: "%", hintKey: "gross_margin" },
+    { key: "op_expense_ratio", label: "费用率", unit: "%", hintKey: "op_expense_ratio" },
+    { key: "target_pe", label: "目标 PE", unit: "x", hintKey: "target_pe" },
+    { key: "peg_threshold", label: "PEG 阈值", unit: "x", hintKey: "peg_threshold" },
+  ];
+
+  return (
+    <GlassCard className="mb-4">
+      <button onClick={toggle} className="flex w-full items-center gap-1.5 text-sm font-semibold">
+        <FlaskConical className="h-4 w-4 text-primary" /> 假设分析
+        <span className="text-[11px] font-normal text-muted-foreground/60">调整财务假设，重算「如果…那么…」</span>
+        <ChevronDown className={cn("ml-auto h-4 w-4 text-muted-foreground transition-transform", open && "rotate-180")} />
+      </button>
+
+      {open && (
+        <div className="mt-4">
+          {defsErr && (
+            <div className="flex items-center gap-2 rounded-lg border border-warning/30 bg-warning/5 p-2.5 text-xs text-muted-foreground">
+              <AlertCircle className="h-3.5 w-3.5 shrink-0 text-warning" /> {defsErr}
+            </div>
+          )}
+          <div className="grid grid-cols-2 gap-2 sm:grid-cols-5">
+            {inputs.map((f) => (
+              <div key={f.key}>
+                <label className="mb-1 flex items-baseline justify-between text-[11px] text-muted-foreground">
+                  <span>{f.label}</span>
+                  <span className="text-[10px] text-muted-foreground/50">{baseHint(f.hintKey)}</span>
+                </label>
+                <div className="flex items-center gap-1">
+                  <input
+                    type="number"
+                    value={form[f.key]}
+                    onChange={(e) => setForm((p) => ({ ...p, [f.key]: e.target.value }))}
+                    className="w-full rounded-lg border border-border bg-black/20 px-2 py-1.5 font-mono text-sm outline-none focus:border-primary/50"
+                  />
+                  <span className="text-[11px] text-muted-foreground/60">{f.unit}</span>
+                </div>
+              </div>
+            ))}
+          </div>
+          <div className="mt-3 flex items-center gap-2">
+            <button onClick={() => compute(false)} disabled={loading || aiLoading}
+              className="inline-flex items-center gap-1.5 rounded-lg bg-primary/15 px-4 py-2 text-sm font-medium text-primary hover:bg-primary/25 disabled:opacity-50">
+              {loading ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <FlaskConical className="h-3.5 w-3.5" />} 重新计算
+            </button>
+            {result && result.ai_commentary_status !== "done" && (
+              <button onClick={() => compute(true)} disabled={loading || aiLoading}
+                className="inline-flex items-center gap-1.5 rounded-lg bg-primary/10 px-3 py-2 text-xs font-medium text-primary hover:bg-primary/20 disabled:opacity-50">
+                {aiLoading ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <BrainCircuit className="h-3.5 w-3.5" />} AI 点评假设合理性
+              </button>
+            )}
+          </div>
+          {err && (
+            <div className="mt-2 flex items-center gap-2 rounded-lg border border-destructive/30 bg-destructive/5 p-2 text-xs text-destructive">
+              <AlertCircle className="h-3.5 w-3.5 shrink-0" /> {err}
+            </div>
+          )}
+
+          {result && (
+            <>
+              <div className="mt-4 grid grid-cols-2 gap-2 sm:grid-cols-4">
+                {[
+                  { k: "调整后营收", v: `${result.projected.revenue_yi} 亿`, sub: `基准 ${result.base.revenue_yi ?? "—"} 亿` },
+                  { k: "调整后净利", v: `${result.projected.net_profit_yi} 亿`, sub: `净利率 ${result.projected.net_margin}%` },
+                  { k: "调整后 EPS", v: result.projected.eps != null ? `${result.projected.eps} 元` : "—", sub: `目标 PE ${result.valuation.implied_pe}x` },
+                  { k: "隐含价格", v: result.valuation.implied_price != null ? `${result.valuation.implied_price} 元` : "—", sub: `现价 ${result.base.price} 元` },
+                ].map((m) => (
+                  <div key={m.k} className="rounded-lg bg-muted/30 p-3">
+                    <p className="text-xs text-muted-foreground">{m.k}</p>
+                    <p className="mt-0.5 font-mono text-base font-bold">{m.v}</p>
+                    <p className="text-[11px] text-muted-foreground/60">{m.sub}</p>
+                  </div>
+                ))}
+              </div>
+              <div className="mt-2 flex flex-wrap items-center gap-x-4 gap-y-1 rounded-lg bg-muted/20 p-3 text-sm">
+                <span>潜在空间：
+                  <b className={cn("ml-1 font-mono text-lg", result.valuation.upside_pct != null && result.valuation.upside_pct > 0 ? "text-danger" : result.valuation.upside_pct != null && result.valuation.upside_pct < 0 ? "text-success" : "")}>
+                    {result.valuation.upside_pct != null ? `${result.valuation.upside_pct > 0 ? "+" : ""}${result.valuation.upside_pct}%` : "—"}
+                  </b>
+                </span>
+                <span className="text-xs text-muted-foreground">隐含利润增速 {result.valuation.profit_growth_pct ?? "—"}%</span>
+                <span className="text-xs text-muted-foreground">
+                  情景 PEG <b className="font-mono">{result.valuation.scenario_peg ?? "—"}</b>
+                  {result.valuation.scenario_peg != null && (
+                    <span className={cn("ml-1", result.valuation.scenario_peg > result.valuation.peg_threshold ? "text-warning" : "text-success")}>
+                      （阈值 {result.valuation.peg_threshold}，{result.valuation.scenario_peg > result.valuation.peg_threshold ? "偏贵" : "合理区间内"}）
+                    </span>
+                  )}
+                </span>
+              </div>
+              {result.ai_commentary && (
+                <div className="mt-2 rounded-lg border border-primary/20 bg-primary/5 p-3">
+                  <p className="mb-1 flex items-center gap-1.5 text-xs font-semibold text-primary"><BrainCircuit className="h-3 w-3" /> AI 点评</p>
+                  <p className="whitespace-pre-wrap text-xs leading-relaxed text-foreground/80">{result.ai_commentary}</p>
+                </div>
+              )}
+            </>
+          )}
+          <p className="mt-3 text-[11px] text-muted-foreground/60">
+            简化损益模型：净利率 ≈ 毛利率 − 费用率（忽略税项与其他损益）。推演结果仅为算术演算，不构成投资建议。
+          </p>
+        </div>
+      )}
+    </GlassCard>
   );
 }
 
@@ -318,6 +489,9 @@ export function StockData() {
               <p className="mt-3 text-xs text-warning">{val.forecast_note}</p>
             )}
           </GlassCard>
+
+          {/* 假设分析（沙盒）：估值卡下方，调整假设重算估值 */}
+          <ScenarioPanel code={val.code} />
 
           {/* 财报速览（结论先行摘要，借鉴 equity-research 的结构纪律，剔除评级/目标价） */}
           <EarningsSnapshot val={val} fin={fin} pctl={pctl} />
